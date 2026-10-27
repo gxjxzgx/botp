@@ -1,7 +1,9 @@
 # cf-probe (Python): CF-Server-Monitor 探针, 纯 Python 读 /proc 上报, 不需要 root/systemd/二进制。
+# 合并版: botp(独立模块、看门狗、urllib 无依赖、venv 感知的 pip) + 脚本内置探针的改进
+#        (TCP ping 只解析一次且 IPv4 优先、ack 非 JSON 容错、断线立即重连、curl 兜底查公网 IP)。
 # 本文件不含任何密钥或上报地址, 配置全部由调用方传入:
-#   import probe; probe.start({'PROBE_ID': ..., 'PROBE_SECRET': ..., 'PROBE_URL': ...}, logger)
-# 也可单独运行: PROBE_ID=xx PROBE_SECRET=xx PROBE_URL=https://.../update python3 probe.py
+#   import botp; botp.start({'PROBE_ID': ..., 'PROBE_SECRET': ..., 'PROBE_URL': ...}, logger)
+# 也可单独运行: PROBE_ID=xx PROBE_SECRET=xx PROBE_URL=https://.../update python3 botp.py
 import os
 import sys
 import re
@@ -106,6 +108,14 @@ def _fetch_public_ip_version(version='v4', timeout=3):
     host = 'ipv4.ip.sb' if version == 'v4' else 'ipv6.ip.sb'
     try:
         ip = _http_get_text(f'http://{host}', timeout).strip()
+        if ip and _looks_like_ip(ip):
+            return ip
+    except Exception:
+        pass
+    try:   # urllib 失败(如某些代理/证书环境)时用 curl 再试一次
+        result = subprocess.run(['curl', '-sm', str(int(timeout) + 2), host],
+                                capture_output=True, text=True, timeout=timeout + 3)
+        ip = result.stdout.strip()
         if ip and _looks_like_ip(ip):
             return ip
     except Exception:
@@ -312,15 +322,30 @@ def _probe_tcp_ping(target, count=4, timeout=1.5):
     host, port = _probe_parse_host_port(target, default_port=443)
     if not host:
         return None, None
+    try:
+        # 先解析一次, 后面直接连 IP: 否则每次计时都把 DNS 查询算进 ping, 数值偏高
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        infos.sort(key=lambda x: x[0] != socket.AF_INET)   # IPv4 优先: dualstack 域名常先返回 v6, 机器没 v6 路由时会被误判 100% 丢包
+        fam, _, _, _, addr = infos[0]
+    except (OSError, IndexError):
+        return None, 100.0
     times = []
     failures = 0
     for _ in range(max(1, count)):
-        start = time.time()
         try:
-            with socket.create_connection((host, port), timeout=timeout):
-                times.append((time.time() - start) * 1000)
+            sk = socket.socket(fam, socket.SOCK_STREAM)
+        except OSError:
+            failures += 1   # fd 耗尽 / 没有该协议栈: 记为丢包, 不让整次上报失败
+            continue
+        sk.settimeout(timeout)
+        start = time.perf_counter()
+        try:
+            sk.connect(addr)
+            times.append((time.perf_counter() - start) * 1000)
         except OSError:
             failures += 1
+        finally:
+            sk.close()
     total = max(1, count)
     loss = round(failures / total * 100, 2)
     if not times:
@@ -556,7 +581,12 @@ def start_probe_ws_loop(gen=None):
                     try:
                         raw = ws.recv()
                         logger.debug(f'[probe] raw ack: {raw}')
-                        resp = json.loads(raw)
+                        try:
+                            resp = json.loads(raw)
+                        except ValueError:
+                            resp = {}   # ack 不是 JSON: 不致命, 按默认间隔继续
+                        if not isinstance(resp, dict):
+                            resp = {}
                         if resp.get('type') == 'error':
                             logger.error(f"[probe] WSS error: {resp.get('error')} (code {resp.get('code')})")
                             raise RuntimeError('protocol error')
@@ -565,10 +595,12 @@ def start_probe_ws_loop(gen=None):
                         if isinstance(next_ms, (int, float)) and next_ms > 0:
                             next_wait = max(1, next_ms / 1000)
                         logger.debug(f'[probe] next report in {next_wait}s')
-                    except (ValueError, RuntimeError):
+                    except RuntimeError:
                         raise
                     except Exception:
-                        pass  # ack解析失败不致命,按默认间隔继续
+                        if not getattr(ws, 'connected', True):
+                            raise   # 连接已断: 交给外层立即重连, 不要再空等 next_wait
+                        # 只是超时/解析失败不致命, 按默认间隔继续
 
                     _wd_sleep(next_wait, gen)
                 try:
