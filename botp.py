@@ -1,6 +1,7 @@
 # cf-probe (Python): CF-Server-Monitor 探针, 纯 Python 读 /proc 上报, 不需要 root/systemd/二进制。
-# 合并版: botp(独立模块、看门狗、urllib 无依赖、venv 感知的 pip) + 脚本内置探针的改进
+# 合并版: botp(独立模块、看门狗、urllib 无依赖) + 脚本内置探针的改进
 #        (TCP ping 只解析一次且 IPv4 优先、ack 非 JSON 容错、断线立即重连、curl 兜底查公网 IP)。
+# 只用标准库: WSS 由内置 _MiniWS 实现, 不需要 pip 安装 websocket-client。
 # 本文件不含任何密钥或上报地址, 配置全部由调用方传入:
 #   import botp; botp.start({'PROBE_ID': ..., 'PROBE_SECRET': ..., 'PROBE_URL': ...}, logger)
 # 也可单独运行: PROBE_ID=xx PROBE_SECRET=xx PROBE_URL=https://.../update python3 botp.py
@@ -14,14 +15,12 @@ import platform
 import threading
 import subprocess
 import urllib.request
+import ssl
+import base64
+import hashlib
+import struct
 import ipaddress
 from urllib.parse import urlparse
-
-try:
-    import websocket as _ws_client  # websocket-client; 实时 WSS 上报, 缺失时自动安装
-    _WS_AVAILABLE = True
-except ImportError:
-    _WS_AVAILABLE = False
 
 import logging
 
@@ -62,7 +61,6 @@ _CFG_KEYS = ('PROBE_ID', 'PROBE_SECRET', 'PROBE_URL', 'PROBE_INTERVAL', 'PROBE_C
 _wd = {'gen': 0, 'last_ok': 0.0, 'thread': None, 'ws': None, 'lock': threading.Lock(), 'restarts': 0}
 PROBE_WATCHDOG = os.environ.get('PROBE_WATCHDOG', 'true').lower() not in ('false', '0', 'no', 'disable')  # 看门狗开关
 PROBE_WATCHDOG_MISS = _env_int('PROBE_WATCHDOG_MISS', 5)  # 连续多少个上报周期没成功就重启上报循环
-_ws_install_tried = False
 
 
 def _wd_ok():
@@ -464,60 +462,170 @@ def start_probe_loop(gen=None):
     t.start()
 
 # =========================== 探针 WSS 实时上报 ===========================
-def _pip_install(package):
-    """用当前解释器的pip安装package,先尝试普通安装,PEP668环境(externally-managed-environment)
-    再补--break-system-packages重试一次;返回(是否成功, 最后一次报错信息)"""
-    py = sys.executable
-    in_venv = sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
-    if in_venv:
-        # 虚拟环境里 --user 必然报错, 直接装进 venv
-        attempts = [[py, '-m', 'pip', 'install', '-q', package]]
-    else:
-        attempts = [
-            [py, '-m', 'pip', 'install', '--user', '-q', package],
-            [py, '-m', 'pip', 'install', '--user', '--break-system-packages', '-q', package],
-        ]
-    last_err = ''
-    for cmd in attempts:
+class _WSClosed(ConnectionError):
+    pass
+
+
+class _MiniWS:
+    """标准库实现的最小 WebSocket 客户端(只用到文本帧/ping/pong/close), 不依赖 websocket-client。
+    支持 ws/wss, 以及 HTTPS_PROXY/HTTP_PROXY 的 http CONNECT 代理(遵守 NO_PROXY)"""
+    _GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+    def __init__(self, url, timeout=15, header=()):
+        u = urlparse(url)
+        secure = u.scheme == 'wss'
+        host, port = u.hostname, u.port or (443 if secure else 80)
+        self.connected = False
+        self._buf = b''
+        sock = self._open(host, port, secure, timeout)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-            if result.returncode == 0:
-                return True, ''
-            last_err = (result.stderr or result.stdout or '').strip()
-        except Exception as e:
-            last_err = str(e)
-    return False, last_err
+            if secure:
+                sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+            key = base64.b64encode(os.urandom(16)).decode()
+            hosthdr = host if port in (80, 443) else f'{host}:{port}'
+            req = [f'GET {u.path or "/"}{"?" + u.query if u.query else ""} HTTP/1.1', f'Host: {hosthdr}',
+                   'Upgrade: websocket', 'Connection: Upgrade', f'Sec-WebSocket-Key: {key}',
+                   'Sec-WebSocket-Version: 13', *header]
+            sock.sendall(('\r\n'.join(req) + '\r\n\r\n').encode())
+            self.sock = sock
+            head = self._read_head()
+            status = head.split(b'\r\n', 1)[0].decode('latin-1')
+            if ' 101 ' not in status + ' ':
+                raise ConnectionError(f'WebSocket handshake failed: {status}')
+            accept = base64.b64encode(hashlib.sha1((key + self._GUID).encode()).digest()).decode()
+            if accept.encode() not in head:
+                raise ConnectionError('WebSocket handshake failed: bad Sec-WebSocket-Accept')
+        except Exception:
+            sock.close()
+            raise
+        self.connected = True
 
-def _ensure_ws_client():
-    """确保 websocket-client 可用;缺失时尝试自动pip安装并在当前进程内直接加载,无需重启"""
-    global _ws_client, _WS_AVAILABLE, _ws_install_tried
-    if _WS_AVAILABLE:
-        return True
-    if _ws_install_tried:  # 看门狗重启时不重复 pip 安装
-        return False
-    _ws_install_tried = True
+    @staticmethod
+    def _open(host, port, secure, timeout):
+        proxy = '' if urllib.request.proxy_bypass_environment(host) else \
+            urllib.request.getproxies_environment().get('https' if secure else 'http', '')
+        if not proxy:
+            return socket.create_connection((host, port), timeout=timeout)
+        p = urlparse(proxy if '://' in proxy else 'http://' + proxy)
+        if p.scheme not in ('http', 'https'):
+            return socket.create_connection((host, port), timeout=timeout)   # 只支持 http CONNECT 代理, 其它直连
+        sock = socket.create_connection((p.hostname, p.port or 80), timeout=timeout)
+        auth = ''
+        if p.username:
+            from urllib.parse import unquote
+            cred = base64.b64encode(f'{unquote(p.username)}:{unquote(p.password or "")}'.encode()).decode()
+            auth = f'Proxy-Authorization: Basic {cred}\r\n'
+        sock.sendall(f'CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n'.encode())
+        resp = b''
+        while b'\r\n\r\n' not in resp:
+            ch = sock.recv(1)   # 逐字节读, 不吞掉隧道数据
+            if not ch or len(resp) > 8192:
+                sock.close()
+                raise ConnectionError('proxy CONNECT failed')
+            resp += ch
+        status = resp.split(b'\r\n', 1)[0]
+        if b' 200' not in status:
+            sock.close()
+            raise ConnectionError('proxy CONNECT failed: ' + status.decode('latin-1'))
+        return sock
 
-    logger.info('[probe] websocket-client not found, attempting automatic install for real-time WSS reporting...')
-    ok, err = _pip_install('websocket-client')
-    if not ok:
-        logger.error(f'[probe] automatic install failed, staying on POST polling: {err[:300]}')
-        return False
+    def _fill(self, n):
+        while len(self._buf) < n:
+            ch = self.sock.recv(65536)
+            if not ch:
+                self.connected = False
+                raise _WSClosed('connection closed')
+            self._buf += ch
 
-    try:
-        import site
-        import importlib
-        user_site = site.getusersitepackages()
-        if user_site and user_site not in sys.path:
-            sys.path.insert(0, user_site)
-        importlib.invalidate_caches()
-        import websocket as _wsmod
-        _ws_client = _wsmod
-        _WS_AVAILABLE = True
-        logger.info('[probe] websocket-client installed and loaded, switching to real-time WSS reporting')
-        return True
-    except Exception as e:
-        logger.error(f'[probe] websocket-client installed but failed to load in this process: {e}')
-        return False
+    def _take(self, n):
+        self._fill(n)
+        d, self._buf = self._buf[:n], self._buf[n:]
+        return d
+
+    def _read_head(self):
+        while b'\r\n\r\n' not in self._buf:
+            if len(self._buf) > 16384:
+                raise ConnectionError('WebSocket handshake: header too large')
+            self._fill(len(self._buf) + 1)
+        head, self._buf = self._buf.split(b'\r\n\r\n', 1)
+        return head
+
+    def settimeout(self, t):
+        self.sock.settimeout(t)
+
+    def _send_frame(self, opcode, payload):
+        n = len(payload)
+        hdr = bytes([0x80 | opcode])
+        if n < 126:
+            hdr += bytes([0x80 | n])
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + struct.pack('!H', n)
+        else:
+            hdr += bytes([0x80 | 127]) + struct.pack('!Q', n)
+        mask = os.urandom(4)
+        body = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        try:
+            self.sock.sendall(hdr + mask + body)
+        except OSError:
+            self.connected = False
+            raise
+
+    def send(self, text):
+        self._send_frame(0x1, text.encode('utf-8'))
+
+    def recv(self):
+        """返回下一条文本/二进制消息(str); 自动回 pong; 对方关闭时抛 _WSClosed。超时抛 socket.timeout 且连接仍可用"""
+        parts, first_op = [], None
+        while True:
+            self._fill(2)   # 超时发生在这里时缓冲区未消费, 连接状态不变
+            b1, b2 = self._buf[0], self._buf[1]
+            n, off = b2 & 0x7F, 2
+            if n == 126:
+                self._fill(4)
+                n, off = struct.unpack('!H', self._buf[2:4])[0], 4
+            elif n == 127:
+                self._fill(10)
+                n, off = struct.unpack('!Q', self._buf[2:10])[0], 10
+            if b2 & 0x80:
+                off += 4   # 服务端帧不应带掩码, 带了也照样解
+            self._fill(off + n)
+            mask = self._buf[off - 4:off] if b2 & 0x80 else None
+            self._take(off)
+            data = self._take(n)
+            if mask:
+                data = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+            op = b1 & 0x0F
+            if op == 0x8:
+                self.connected = False
+                try:
+                    self._send_frame(0x8, data[:2])
+                except OSError:
+                    pass
+                raise _WSClosed('closed by server')
+            if op == 0x9:
+                self._send_frame(0xA, data)
+                continue
+            if op == 0xA:
+                continue
+            if op in (0x1, 0x2):
+                first_op = op
+            parts.append(data)
+            if b1 & 0x80:
+                msg = b''.join(parts)
+                return msg.decode('utf-8', 'replace') if first_op == 0x1 else msg.decode('latin-1')
+
+    def close(self):
+        if self.connected:
+            try:
+                self._send_frame(0x8, struct.pack('!H', 1000))
+            except OSError:
+                pass
+        self.connected = False
+        for fn in (lambda: self.sock.shutdown(socket.SHUT_RDWR), self.sock.close):   # shutdown 能唤醒别的线程里阻塞的 recv
+            try:
+                fn()
+            except OSError:
+                pass
 
 def _probe_ws_url():
     """把 PROBE_URL 的 http(s) 换成 ws(s),路径不变(官方协议同一路径区分POST和Upgrade)"""
@@ -526,8 +634,7 @@ def _probe_ws_url():
     return f'{scheme}://{parsed.netloc}{parsed.path}'
 
 def start_probe_ws_loop(gen=None):
-    """优先走WSS长连接实现秒级实时上报;websocket-client未安装、被禁用或连接持续失败时,
-    自动退回start_probe_loop()的POST轮询(60秒一次),行为不会比原来差"""
+    """优先走WSS长连接实现秒级实时上报(内置 _MiniWS, 无需装包); 被禁用时只走 POST 轮询, 连接持续失败时临时退回 POST"""
     if not (PROBE_ID and PROBE_SECRET and PROBE_URL):
         logger.info('PROBE variable is empty, skipping probe')
         return
@@ -535,11 +642,6 @@ def start_probe_ws_loop(gen=None):
     gen = _wd['gen'] if gen is None else gen
     if not PROBE_WSS:
         logger.info('[probe] PROBE_WSS is false, using POST polling only')
-        start_probe_loop(gen)
-        return
-
-    if not _WS_AVAILABLE and not _ensure_ws_client():
-        logger.info('[probe] websocket-client unavailable, falling back to POST polling')
         start_probe_loop(gen)
         return
 
@@ -555,7 +657,7 @@ def start_probe_ws_loop(gen=None):
         while _wd_alive(gen):
             ws = None
             try:
-                ws = _ws_client.create_connection(
+                ws = _MiniWS(
                     ws_url,
                     timeout=15,
                     header=[
